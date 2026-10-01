@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -197,4 +198,77 @@ func TestTooBig(t *testing.T) {
 	if _, p := mac.recv(); len(p) != maxPayload {
 		t.Fatal(len(p))
 	}
+}
+
+func TestReadyListsICE(t *testing.T) {
+	hub := NewHub(ICEServer{URLs: []string{"stun:stun.example:3478"}})
+	hub.logf = func(string, ...any) {}
+	srv := httptest.NewServer(hub)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.CloseNow()
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	_, data, _ := ws.Read(ctx)
+	var ch map[string]string
+	json.Unmarshal(data, &ch)
+	nonce, _ := b64.DecodeString(ch["nonce"])
+	login, _ := json.Marshal(map[string]string{"t": "login", "id": b64.EncodeToString(pub),
+		"sig": b64.EncodeToString(ed25519.Sign(priv, LoginMessage(strings.TrimPrefix(srv.URL, "http://"), nonce)))})
+	ws.Write(ctx, websocket.MessageText, login)
+	_, data, _ = ws.Read(ctx)
+	if !strings.Contains(string(data), `"ice":[{"urls":["stun:stun.example:3478"]}]`) {
+		t.Fatalf("%s", data)
+	}
+}
+
+// A lossy frame for a recipient that is behind is dropped at once: no waiting, no error.
+func TestLossyDropsWhenBehind(t *testing.T) {
+	hub := NewHub()
+	from := &conn{id: "from", out: make(chan outFrame, 8), done: make(chan struct{})}
+	to := &conn{id: "to", out: make(chan outFrame), live: make(chan outFrame, 1), done: make(chan struct{}),
+		allow: map[string]bool{"from": true}}
+	hub.conns["to"] = to
+	frame := func() []byte {
+		head, _ := json.Marshal(Header{To: "to", ID: "m", Last: true, Lossy: true})
+		return append(binary.BigEndian.AppendUint16(nil, uint16(len(head))), append(head, "opus"...)...)
+	}
+	start := time.Now()
+	for range 3 {
+		hub.forward(context.Background(), from, frame())
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("lossy send waited on a full queue")
+	}
+	if len(to.live) != 1 || len(from.out) != 0 {
+		t.Fatalf("queued %d, errors %d", len(to.live), len(from.out))
+	}
+}
+
+// Live frames go ahead of a backlog of ordinary ones.
+func TestLiveGoesFirst(t *testing.T) {
+	srv := setup(t)
+	mac, phone := dial(t, srv), dial(t, srv)
+	mac.writeJSON(map[string]any{"t": "policy", "allow": []string{phone.id}})
+	settle()
+	for i := range 20 {
+		phone.send(Header{To: mac.id, ID: fmt.Sprint("bulk", i), Last: true}, make([]byte, maxPayload))
+	}
+	phone.send(Header{To: mac.id, ID: "audio", Last: true, Lossy: true}, []byte("opus"))
+	seen := 0
+	for range 21 {
+		h, _ := mac.recv()
+		if h.ID == "audio" {
+			if seen == 20 {
+				t.Fatal("audio came last, behind all the bulk frames")
+			}
+			return
+		}
+		seen++
+	}
+	t.Fatal("audio never arrived")
 }

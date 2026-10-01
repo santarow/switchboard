@@ -85,18 +85,21 @@ class Conn:
         await self.ws.send(json.dumps({"t": "login", "id": self.keys.id, "sig": b64e(self.keys.sign.sign(msg))}))
         ready = json.loads(await self.ws.recv())
         assert ready.get("t") == "ready", ready
+        self.ice = ready.get("ice") or []
         self.reader = asyncio.create_task(self._read())
         return self
 
     async def policy(self, allow=(), tickets=()):
         await self.ws.send(json.dumps({"t": "policy", "allow": list(allow), "tickets": list(tickets)}))
 
-    async def send(self, to, msg_id, box, key=None, ticket=None):
+    async def send(self, to, msg_id, box, key=None, ticket=None, lossy=False):
         chunks = [box[i:i + CHUNK] for i in range(0, len(box), CHUNK)] or [b""]
+        assert not lossy or len(chunks) == 1, "a lossy message must fit one frame"
         for seq, part in enumerate(chunks):
             h = {"to": to, "id": msg_id, "seq": seq, "last": seq == len(chunks) - 1}
             if key: h["key"] = key
             if ticket: h["ticket"] = ticket
+            if lossy: h["lossy"] = True
             hb = json.dumps(h, separators=(",", ":")).encode()
             await self.ws.send(struct.pack(">H", len(hb)) + hb + part)
 
@@ -136,6 +139,7 @@ class Phone:
     def __init__(self, url, keys, mac_id, mac_key):
         self.keys, self.mac_id, self.mac_key = keys, mac_id, mac_key
         self.conn = Conn(url, keys, self._on_message)
+        self.events = asyncio.Queue()    # call signaling and media from the Mac
 
     async def connect(self):
         await self.conn.connect()
@@ -149,9 +153,17 @@ class Phone:
             head, body = parse_inner(open_box(self.keys, self.mac_id, self.mac_key, h["id"], box))
         except Exception:
             return              # not sealed by our Mac: drop
+        if head.get("t") != "res":
+            return await self.events.put((head, body))
         f = self.conn.pending.pop(head.get("re"), None)
         if f and not f.done():
             f.set_result((head, body))
+
+    async def post(self, head, body=b"", lossy=False):
+        """A message that isn't a request: call signaling, or a frame of live audio."""
+        msg_id = b64e(os.urandom(16))
+        await self.conn.send(self.mac_id, msg_id, seal(self.keys, self.mac_id, self.mac_key, msg_id, inner(head, body)),
+                             lossy=lossy)
 
     async def request(self, method, path, headers=None, body=b"", ticket=None, timeout=30):
         msg_id = b64e(os.urandom(16))

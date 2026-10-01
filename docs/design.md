@@ -107,7 +107,7 @@ Protocol 1 calls are HTTP turns, so they already work over envelopes (above) wit
 
 1. **Signaling:** SDP offer and answer and ICE candidates travel as envelopes. Sealed, so the DTLS
    fingerprints can't be swapped by Switchboard.
-2. **Direct:** WebRTC peer to peer with STUN (pion, served by Switchboard where UDP is reachable).
+2. **Direct:** WebRTC peer to peer. Switchboard tells clients which STUN server to use (`-stun`).
 3. **Fallback:**
 
 | where Switchboard runs | fallback when direct fails |

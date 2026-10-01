@@ -28,6 +28,7 @@ const (
 	sendTimeout  = 10 * time.Second // how long a sender waits on a slow recipient
 	replyPassFor = 2 * time.Minute  // a device that sent a ticketed frame may be answered this long
 	queueFrames  = 256
+	queueLive    = 64  // live audio frames waiting; more are dropped, never queued behind
 	ratePerSec   = 400 // frames per second per connection, with the same burst
 )
 
@@ -40,16 +41,24 @@ type Hub struct {
 	replyPass map[[2]string]time.Time // {sender, recipient} → until
 	now       func() time.Time
 	logf      func(string, ...any)
+	ice       []ICEServer
 }
 
-func NewHub() *Hub {
-	return &Hub{conns: map[string]*conn{}, replyPass: map[[2]string]time.Time{}, now: time.Now, logf: log.Printf}
+// ICEServer is a STUN or TURN server the clients may use for direct calls, in WebRTC's shape.
+type ICEServer struct {
+	URLs []string `json:"urls"`
+}
+
+// NewHub makes a hub that tells clients about these ICE servers when they log in.
+func NewHub(ice ...ICEServer) *Hub {
+	return &Hub{conns: map[string]*conn{}, replyPass: map[[2]string]time.Time{}, now: time.Now, logf: log.Printf, ice: ice}
 }
 
 type conn struct {
 	id      string
 	ws      *websocket.Conn
 	out     chan outFrame
+	live    chan outFrame // lossy frames: sent before out, dropped when full
 	done    chan struct{}
 	allow   map[string]bool
 	tickets map[string]time.Time // sha256(code) hex → expiry
@@ -69,6 +78,7 @@ type Header struct {
 	Last   bool   `json:"last"`
 	Key    string `json:"key,omitempty"`
 	Ticket string `json:"ticket,omitempty"`
+	Lossy  bool   `json:"lossy,omitempty"` // live audio: drop rather than wait, and go first
 }
 
 type control struct {
@@ -102,7 +112,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ws.Close(websocket.StatusPolicyViolation, "login failed")
 		return
 	}
-	c := &conn{id: id, ws: ws, out: make(chan outFrame, queueFrames), done: make(chan struct{}),
+	c := &conn{id: id, ws: ws, out: make(chan outFrame, queueFrames), live: make(chan outFrame, queueLive), done: make(chan struct{}),
 		allow: map[string]bool{}, tickets: map[string]time.Time{}}
 
 	h.mu.Lock()
@@ -115,7 +125,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logf("connect %s (%d online)", short(id), online)
 
 	go c.writer(ctx, cancel)
-	c.sendJSON(map[string]any{"t": "ready", "id": id})
+	c.sendJSON(map[string]any{"t": "ready", "id": id, "ice": h.ice})
 	err = h.reader(ctx, c)
 
 	close(c.done)
@@ -238,6 +248,13 @@ func (h *Hub) forward(ctx context.Context, c *conn, data []byte) {
 	binary.BigEndian.PutUint16(frame, uint16(len(head)))
 	frame = append(append(frame, head...), data[2+n:]...)
 
+	if hd.Lossy {
+		select {
+		case to.live <- outFrame{websocket.MessageBinary, frame}:
+		default: // the recipient is behind; late audio is worse than lost audio
+		}
+		return
+	}
 	t := time.NewTimer(sendTimeout)
 	defer t.Stop()
 	select {
@@ -268,27 +285,35 @@ func (h *Hub) allowed(sender string, to *conn, ticket string) bool {
 	return false
 }
 
+// writer is the only goroutine that writes to the socket. Live audio goes before anything queued.
 func (c *conn) writer(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 	for {
+		var f outFrame
 		select {
-		case f := <-c.out:
-			wctx, wcancel := context.WithTimeout(ctx, sendTimeout)
-			err := c.ws.Write(wctx, f.typ, f.data)
-			wcancel()
-			if err != nil {
+		case f = <-c.live:
+		default:
+			select {
+			case f = <-c.live:
+			case f = <-c.out:
+			case <-ping.C:
+				pctx, pcancel := context.WithTimeout(ctx, sendTimeout)
+				err := c.ws.Ping(pctx)
+				pcancel()
+				if err != nil {
+					return
+				}
+				continue
+			case <-ctx.Done():
 				return
 			}
-		case <-ping.C:
-			pctx, pcancel := context.WithTimeout(ctx, sendTimeout)
-			err := c.ws.Ping(pctx)
-			pcancel()
-			if err != nil {
-				return
-			}
-		case <-ctx.Done():
+		}
+		wctx, wcancel := context.WithTimeout(ctx, sendTimeout)
+		err := c.ws.Write(wctx, f.typ, f.data)
+		wcancel()
+		if err != nil {
 			return
 		}
 	}

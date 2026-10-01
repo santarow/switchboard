@@ -138,6 +138,8 @@ async def phone_steps(link):
     except sb.Failed as e:
         check(str(e) == "not_allowed", f"stranger is refused ({e})")
 
+    await call_steps(phone)
+
     st, _, _ = await phone.request("DELETE", "/buddy/device", auth)
     check(st == 200, "unpair → 200")
     await asyncio.sleep(0.2)
@@ -150,12 +152,54 @@ async def phone_steps(link):
     return paired["token"]
 
 
+async def call_steps(phone):
+    """#140: signaling as sealed messages, then the fallback: live audio over the socket."""
+    check(phone.conn.ice == [{"urls": ["stun:stun.example:3478"]}], "login lists the STUN server")
+
+    async def next_event(kind=None, secs=5):
+        while True:
+            head, body = await asyncio.wait_for(phone.events.get(), secs)
+            if kind is None or head.get("kind") == kind:
+                return head, body
+
+    await phone.post({"t": "call", "call": "c1", "kind": "offer", "sdp": "v=0 SECRET-SDP"})
+    head, _ = await next_event("answer")
+    check(head["call"] == "c1" and head["sdp"].startswith("v=0"), "offer → answer, sealed")
+    await phone.post({"t": "call", "call": "c1", "kind": "relay"})
+    head, _ = await next_event("relay")
+    check(head["call"] == "c1", "both sides agree to relay audio over Switchboard")
+
+    # 2 s of 20 ms frames, about the size of 32 kbit/s Opus, each sealed on its own.
+    sent, rtts = 100, []
+
+    async def receive():
+        while True:
+            head, body = await phone.events.get()
+            if head.get("t") == "media" and head.get("echo"):
+                rtts.append(time.perf_counter() - head["sent"])
+
+    rx = asyncio.create_task(receive())
+    for i in range(sent):
+        await phone.post({"t": "media", "call": "c1", "seq": i, "codec": "opus", "sent": time.perf_counter()},
+                         os.urandom(80), lossy=True)
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.5)
+    rx.cancel()
+    rtts.sort()
+    got = len(rtts)
+    med = rtts[got // 2] * 1000 if rtts else 0
+    p95 = rtts[int(got * 0.95) - 1] * 1000 if rtts else 0
+    check(got >= sent * 0.98, f"relayed audio: {got}/{sent} frames came back")
+    check(med < 50, f"round trip on localhost: median {med:.1f} ms, p95 {p95:.1f} ms")
+    await phone.post({"t": "call", "call": "c1", "kind": "bye"})
+
+
 def main():
     print(f"work dir {tmp}")
     binary = os.path.join(tmp, "switchboard")
     subprocess.run(["go", "build", "-o", binary, "."], cwd=ROOT, check=True)
     sb_log = os.path.join(tmp, "switchboard.log")
-    start([binary, "-addr", f"127.0.0.1:{SB_PORT}"], sb_log)
+    start([binary, "-addr", f"127.0.0.1:{SB_PORT}", "-stun", "stun:stun.example:3478"], sb_log)
     wait_for(lambda: urllib.request.urlopen(SB_URL + "/healthz").status == 200, "switchboard")
 
     mock = os.path.join(tmp, "mock", "mock_workshop.py")
@@ -174,7 +218,7 @@ def main():
     token = asyncio.run(phone_steps(open(os.path.join(state, "broker-link.txt")).read().strip()))
 
     log = open(sb_log).read()
-    secrets = [token, "Holly", "mock Workshop", "Test iPhone", "buddy/", "RIFF"]
+    secrets = [token, "Holly", "mock Workshop", "Test iPhone", "buddy/", "RIFF", "SECRET-SDP", "opus"]
     check(not any(s in log for s in secrets), "Switchboard's log has no token, names, paths or audio")
     print("--- switchboard.log"); print(log.rstrip())
 

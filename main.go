@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jasonjias/switchboard/relay"
@@ -15,10 +16,16 @@ var version = "dev"
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8790", "listen address (cloudflared points here)")
+	stun := flag.String("stun", "", "STUN servers for direct calls, comma separated (e.g. stun:stun.cloudflare.com:3478)")
 	flag.Parse()
 
+	var ice []relay.ICEServer
+	if *stun != "" {
+		ice = append(ice, relay.ICEServer{URLs: strings.Split(*stun, ",")})
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("GET /v1/connect", relay.NewHub())
+	mux.Handle("GET /v1/connect", relay.NewHub(ice...))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true,"version":"` + version + `"}`))

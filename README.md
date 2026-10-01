@@ -9,8 +9,11 @@ relays sealed messages between paired keys and never holds a key that can open t
 ## Run
 
 ```bash
-go build -o switchboard . && ./switchboard -addr 127.0.0.1:8790
+go build -o switchboard . && ./switchboard -addr 127.0.0.1:8790 -stun stun:stun.cloudflare.com:3478
 ```
+
+`-stun` is the STUN server clients use to try a direct call first; Switchboard passes it on and needs
+no UDP itself.
 
 `GET /healthz` answers `{"ok":true}`. Clients connect to `GET /v1/connect` (WebSocket). Put it behind
 TLS (for example a Cloudflare Tunnel pointed at the address above).

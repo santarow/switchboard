@@ -93,6 +93,10 @@ async def main():
             print("dropped a box that didn't open", flush=True)
             return
         seen.append((h["from"], h["id"]))
+        if head.get("t") in ("call", "media"):
+            if peer:
+                await call_message(h["from"], peer_key, head, body)
+            return
         path = head["path"]
         if not peer and path != "/buddy/pair":
             return                     # strangers may only pair
@@ -116,6 +120,22 @@ async def main():
         if path == "/buddy/device" and status == 200:
             await push_policy(conn)    # after the answer, so the phone still hears it
         print(f"{time.strftime('%H:%M:%S')} {head['method']} {path.split('?')[0]} → {status}", flush=True)
+
+    async def post(to, to_key, head, body=b"", lossy=False):
+        msg_id = sb.b64e(os.urandom(16))
+        await conn.send(to, msg_id, sb.seal(keys, to, to_key, msg_id, sb.inner(head, body)), lossy=lossy)
+
+    async def call_message(frm, frm_key, head, body):
+        """Stand-in for Workshop's call side: answers an offer, agrees to relay, and plays each
+        audio frame straight back, so the phone can time the round trip."""
+        if head["t"] == "media":
+            return await post(frm, frm_key, {**head, "echo": True}, body, lossy=True)
+        kind = head.get("kind")
+        if kind == "offer":
+            await post(frm, frm_key, {"t": "call", "call": head["call"], "kind": "answer", "sdp": "v=0 (mock answer)"})
+        elif kind == "relay":
+            await post(frm, frm_key, {"t": "call", "call": head["call"], "kind": "relay"})
+        print(f"{time.strftime('%H:%M:%S')} call {kind}", flush=True)
 
     while True:
         try:

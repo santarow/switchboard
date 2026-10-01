@@ -31,7 +31,9 @@ The phone trusts `mac_id` and `mac_key` only from the QR, never from Switchboard
 3. Send text `{"t": "login", "id": "<identity>", "sig": "<Ed25519 signature>"}` over the bytes
    `"switchboard-v1 login\n" + host + "\n" + nonce`, where `host` is the URL's host with its port if
    it has one (`switchboard.example`, `127.0.0.1:8790`).
-4. Switchboard answers `{"t": "ready", "id": "<identity>"}`, or closes with code 1008 (bad login).
+4. Switchboard answers `{"t": "ready", "id": "<identity>", "ice": [{"urls": ["stun:…"]}]}`, or closes
+   with code 1008 (bad login). `ice` lists STUN/TURN servers for direct calls (section 8), in WebRTC's
+   `RTCIceServer` shape; it may be empty.
 5. Send your policy (section 4) right away, and again whenever it changes.
 
 Switchboard pings every 30 s. A newer login with the same identity replaces the older connection.
@@ -79,6 +81,7 @@ Every message is one or more **binary** frames:
 | `seq`, `last` | the box is cut into slices of at most **256 KB**; `seq` counts from 0, `last` marks the final one |
 | `key` | sender's box key. Only on the pairing request, when the Mac doesn't know it yet |
 | `ticket` | only on the pairing request: SHA-256 hex of the QR `code` |
+| `lossy` | live audio only (section 8). Must fit one frame. Sent ahead of anything queued, and dropped, with no error, when the recipient is behind |
 
 Switchboard sets `from` (the sender's logged-in identity, so it can't be faked), strips `ticket`, and
 passes the rest on. The receiver joins the slices in `seq` order when `last` arrives, then opens the
@@ -128,8 +131,45 @@ opens it with the header's `key`, and on `200` stores that identity with that ke
 uses the stored key and ignores `key` in headers. A Mac answers nothing but `/buddy/pair` from an
 identity it hasn't paired.
 
-## 8. Not in v1
+## 8. Calls: signaling and the audio fallback
+
+For live audio (protocol 2). Protocol 1 calls are the HTTP turns of section 7 and need none of this.
+
+Every call message is a sealed envelope whose head is not `req`/`res`:
+
+```json
+{"t": "call", "call": "<call id>", "kind": "offer",  "sdp": "…"}
+{"t": "call", "call": "<call id>", "kind": "answer", "sdp": "…"}
+{"t": "call", "call": "<call id>", "kind": "ice",    "candidate": "…", "sdpMid": "0", "sdpMLineIndex": 0}
+{"t": "call", "call": "<call id>", "kind": "relay"}
+{"t": "call", "call": "<call id>", "kind": "bye"}
+```
+
+1. **Direct first.** The phone makes a WebRTC offer using the `ice` servers from `ready`, the Mac
+   answers, both trickle `ice` candidates. Media then flows peer to peer (DTLS-SRTP). The SDP is
+   sealed, so Switchboard can't swap the DTLS fingerprints in it.
+2. **Fallback.** If the WebRTC connection isn't up 5 seconds after the answer, either side sends
+   `relay`; the other answers `relay` and both send audio through Switchboard instead:
+
+```json
+{"t": "media", "call": "<call id>", "seq": 0, "codec": "opus", "ts": 0}   + one encoded frame as the body
+```
+
+   One 20 ms frame per message, sealed like everything else, sent with `lossy: true`. `seq` counts
+   frames so the receiver can spot gaps and reorder; `ts` is in samples at the codec's rate. `codec`
+   is `opus` (48 kHz mono) or `pcm16` (16 kHz mono, 16-bit little-endian, for testing).
+3. `bye` ends the call either way. Interrupting Holly, `where` and the rest stay HTTP requests
+   (section 7) and can run during a call.
+
+Where Switchboard runs decides the fallback:
+
+| where | `ice` from `ready` | when direct fails |
+|---|---|---|
+| Mac Studio behind a Cloudflare Tunnel (no UDP) | a public STUN server (`-stun`) | relayed audio over the socket, as above |
+| a server with UDP open (later) | STUN plus Switchboard's own TURN | WebRTC's own TURN relay; socket relay as last resort |
+
+## 9. Not in v1
 
 - Forward secrecy: the box keys are long-lived. A later version can add a per-session handshake
   (Noise IK) inside the envelopes without changing Switchboard.
-- Live call audio: see #140.
+- Embedded TURN (pion/turn, MIT) for a server with UDP open.
