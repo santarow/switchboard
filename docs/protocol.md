@@ -92,7 +92,7 @@ If Switchboard can't deliver, it sends the sender text `{"t": "error", "re": "<i
 | error | meaning | Buddy does |
 |---|---|---|
 | `offline` | the Mac isn't connected | this route has no answer: try the next route (pairing.md section 1) |
-| `not_allowed` | not paired (or no longer) | same as `401 unpaired` |
+| `not_allowed` | the Mac's policy on this Switchboard doesn't list you (for example, paired over another route) | this route can't reach the Mac: try the next route and **keep the pairing** (#192). Only the Mac's own `401 unpaired`, inside a sealed answer, means unpaired |
 | `too_big` / `bad_frame` | a bug on the sender | show an error |
 | `slow` / `rate_limited` | Mac not reading fast enough / over 400 frames per second | treat as no answer |
 
