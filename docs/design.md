@@ -4,7 +4,8 @@ Switchboard is SantaRow's message broker. Buddy (iPhone) and Workshop (Mac) both
 it, and it connects them. It forwards sealed envelopes and never sees plaintext. It is the `broker`
 route in `buddy/docs/pairing.md` section 1: only the route changes, never the rest of that contract.
 
-Status: proposal, waiting for Jason's OK before any code (#139, #140).
+Status: approved by Jason 2026-09-30 (Go, Apache-2.0, `cryptography` in a test venv). v0 relay built
+(#139); the exact wire format is [protocol.md](protocol.md), which wins where the two differ.
 
 ## Decision in one table
 
@@ -44,8 +45,6 @@ Notes:
 | Boring server tech | standard library `net/http`, TLS, context | Vapor or Hummingbird on top |
 
 The deciding point: the server forwards bytes. The apps do the crypto in CryptoKit either way.
-
-Not installed yet: Go on this Mac (`brew install go`, BSD-3-Clause). Needs Jason's OK.
 
 ## How it works
 
@@ -88,7 +87,7 @@ Same as pairing.md section 3, sealed:
 ```
 outer (Switchboard reads):  {"to": "<identity key>", "from": "<identity key>", "id": "<16 random bytes>",
                              "ticket": "<optional>", "box": "<base64 ciphertext>"}
-inner (only the two ends):  {"method": "POST", "path": "/buddy/call/turn?start=…", "headers": {…}, "body": "<bytes>"}
+inner (only the two ends):  {"t": "req", "method": "POST", "path": "/buddy/call/turn?start=…", "headers": {…}} + body bytes
 ```
 
 - Seal: X25519(sender, recipient) → HKDF-SHA256 (salt = both identity keys) → ChaCha20-Poly1305,
@@ -133,8 +132,8 @@ Workshop side, flagged now so it isn't a surprise.
 
 End to end on localhost with `buddy/scripts/mock_workshop.py` playing the Mac and a small client
 playing the phone. Python's standard library has no X25519 or ChaCha20-Poly1305, so the test side
-needs `cryptography` (Apache-2.0 OR BSD-3-Clause) in a venv. The mock stays stdlib for the tailnet
-route; only its broker mode needs it.
+needs `cryptography` and `websockets` in a venv. The mock itself is unchanged: `testkit/mac_bridge.py`
+plays Workshop's broker side in front of it.
 
 ## Third-party
 
@@ -145,14 +144,8 @@ route; only its broker mode needs it.
 | github.com/pion/turn (#140, hosted only) | MIT | embedded TURN/STUN |
 | Apple CryptoKit (in the apps) | Apple system framework | X25519, Ed25519, HKDF, ChaCha20-Poly1305 |
 | Google libwebrtc (in the apps, #140) | BSD-3-Clause | WebRTC calls |
-| Python `cryptography` (tests only) | Apache-2.0 OR BSD-3-Clause | test client and mock broker mode |
+| Python `cryptography` (tests only) | Apache-2.0 OR BSD-3-Clause | test clients |
+| Python `websockets` (tests only) | BSD-3-Clause | test clients |
 | Cloudflare Tunnel (`cloudflared`) | Apache-2.0 | reaching the Studio, already used |
 
-Switchboard's own license at v1: Apache-2.0 or MIT, Jason's pick. Apache-2.0 suggested for its patent
-grant.
-
-## Open for Jason
-
-1. OK to build in Go, and to `brew install go`?
-2. Apache-2.0 or MIT for Switchboard?
-3. OK to add `cryptography` to a test venv for #139?
+Switchboard's own license: Apache-2.0 (Jason, 2026-09-30).
