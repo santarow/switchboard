@@ -120,7 +120,7 @@ Apps need a WebRTC library for the direct path (Google's libwebrtc, BSD-3-Clause
 | Listens | `127.0.0.1:8790` by default; a TLS proxy or `cloudflared` points a hostname at it |
 | Keepalive | ping every 30 s (Cloudflare drops idle sockets around 100 s) |
 | Logs | connects, disconnects, errors, and the first 8 characters of a key. **Never** envelope contents, tickets or full keys |
-| Limits | 2 KB header and 256 KB per frame, 16 KB per live audio frame, 400 frames per second per connection |
+| Limits | 2 KB header and 256 KB per frame, 16 KB per live audio frame, 400 frames per second and 32 queued frames per connection, 256 connections (16 per client address), 256 keys and 64 tickets per policy |
 
 ## Testing
 

@@ -43,12 +43,16 @@ one-time pairing `code` (16 random bytes as 32 hex characters) and its expiry. T
    `RTCIceServer` shape; it may be empty.
 5. Send your policy (section 4) right away, and again whenever it changes.
 
+Switchboard may refuse the WebSocket itself with HTTP `429` (too many connections from your address)
+or `503` (full). Retry after a few seconds, backing off.
+
 Switchboard pings every 30 s. A newer login with the same identity replaces the older connection.
 On a drop: reconnect, log in, re-send the policy. Switchboard remembers nothing across connections.
 
 ## 4. Policy: who may reach you
 
-Text frame, replaces the previous one whole:
+Text frame, replaces the previous one whole. At most 256 `allow` keys and 64 `tickets`; a bigger
+policy is refused with `{"t": "error", "error": "too_big"}` and the previous one stays.
 
 ```json
 {"t": "policy", "allow": ["<identity>", …], "tickets": [{"hash": "<64 hex>", "exp": 1790000000}]}
@@ -99,8 +103,8 @@ If Switchboard can't deliver, it sends the sender text `{"t": "error", "re": "<i
 
 | error | meaning | the client does |
 |---|---|---|
-| `offline` | the Mac isn't connected | this route has no answer: try the next route, if the app has one |
-| `not_allowed` | the Mac's policy on this Switchboard doesn't list you (for example, you paired over another route) | this route can't reach the Mac: try the next route and **keep the pairing**. Only the Mac's own answer, inside a sealed envelope, can say you are unpaired |
+| `offline` | the Mac isn't connected. Only senders the Mac allowed hear this | this route has no answer: try the next route, if the app has one |
+| `not_allowed` | the Mac's policy on this Switchboard doesn't list you (for example, you paired over another route). Also what everyone else hears when the Mac is offline or unknown, and what a paired phone hears right after Switchboard restarts, until the Mac reconnects | this route can't reach the Mac: try the next route and **keep the pairing**. Only the Mac's own answer, inside a sealed envelope, can say you are unpaired |
 | `too_big` / `bad_frame` | a bug on the sender | show an error |
 | `slow` / `rate_limited` | Mac not reading fast enough / over 400 frames per second | treat as no answer |
 

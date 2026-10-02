@@ -104,12 +104,30 @@ func TestNotAllowedWithoutPolicy(t *testing.T) {
 	}
 }
 
-func TestOffline(t *testing.T) {
+// Only a sender the recipient allows learns that it is offline; everyone else hears not_allowed,
+// whether the recipient is online, offline, or never seen.
+func TestOfflineOnlyForAllowed(t *testing.T) {
 	srv := setup(t)
-	phone := dial(t, srv)
-	phone.send(Header{To: strings.Repeat("A", 43), ID: "a"}, []byte("x"))
-	if r := phone.readJSON(); r["error"] != "offline" {
-		t.Fatal(r)
+	mac, phone, stranger := dial(t, srv), dial(t, srv), dial(t, srv)
+	mac.writeJSON(map[string]any{"t": "policy", "allow": []string{phone.id}})
+	settle()
+	stranger.send(Header{To: mac.id, ID: "a"}, nil)
+	if r := stranger.readJSON(); r["error"] != "not_allowed" {
+		t.Fatal("stranger, Mac online:", r)
+	}
+	mac.ws.Close(websocket.StatusNormalClosure, "")
+	settle()
+	phone.send(Header{To: mac.id, ID: "b"}, nil)
+	if r := phone.readJSON(); r["error"] != "offline" || r["re"] != "b" {
+		t.Fatal("paired phone, Mac offline:", r)
+	}
+	stranger.send(Header{To: mac.id, ID: "c"}, nil)
+	if r := stranger.readJSON(); r["error"] != "not_allowed" {
+		t.Fatal("stranger, Mac offline:", r)
+	}
+	stranger.send(Header{To: strings.Repeat("A", 43), ID: "d"}, nil)
+	if r := stranger.readJSON(); r["error"] != "not_allowed" {
+		t.Fatal("never seen:", r)
 	}
 }
 
@@ -231,7 +249,7 @@ func TestLossyDropsWhenBehind(t *testing.T) {
 	hub := NewHub()
 	from := &conn{id: "from", out: make(chan outFrame, 8), done: make(chan struct{})}
 	to := &conn{id: "to", out: make(chan outFrame), live: make(chan outFrame, 1), done: make(chan struct{}),
-		allow: map[string]bool{"from": true}}
+		pol: policy{allow: map[string]bool{"from": true}}}
 	hub.conns["to"] = to
 	frame := func() []byte {
 		head, _ := json.Marshal(Header{To: "to", ID: "m", Last: true, Lossy: true})
@@ -352,10 +370,101 @@ func TestReplaceDoesNotBlock(t *testing.T) {
 	defer second.CloseNow()
 	other := dial(t, srv)
 	other.send(Header{To: strings.Repeat("A", 43), ID: "x"}, nil)
-	if r := other.readJSON(); r["error"] != "offline" {
+	if r := other.readJSON(); r["error"] != "not_allowed" {
 		t.Fatal(r)
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("the hub stalled while closing the replaced connection")
+	}
+}
+
+func TestConnectionLimits(t *testing.T) {
+	hub := NewHub()
+	hub.logf = func(string, ...any) {}
+	hub.MaxConns, hub.MaxConnsPerIP = 3, 2
+	srv := httptest.NewServer(hub)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	open := func(from string) (int, *websocket.Conn) {
+		var opts websocket.DialOptions
+		if from != "" {
+			opts.HTTPHeader = map[string][]string{"CF-Connecting-IP": {from}}
+		}
+		ws, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), &opts)
+		if err != nil {
+			return resp.StatusCode, nil
+		}
+		t.Cleanup(func() { ws.CloseNow() })
+		return 101, ws
+	}
+	// From loopback the proxy's header names the client, so two addresses get two slots each.
+	var first *websocket.Conn
+	for i, want := range []struct {
+		from   string
+		status int
+	}{{"192.0.2.1", 101}, {"192.0.2.1", 101}, {"192.0.2.1", 429}, {"192.0.2.2", 101}, {"192.0.2.3", 503}} {
+		got, ws := open(want.from)
+		if got != want.status {
+			t.Fatalf("from %s: got %d, want %d", want.from, got, want.status)
+		}
+		if i == 0 {
+			first = ws
+		}
+	}
+	// A closed connection gives its slot back.
+	first.CloseNow()
+	for range 50 {
+		if got, _ := open("192.0.2.1"); got == 101 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("slot never came back after a close")
+}
+
+func TestIPHeaderOnlyFromLoopback(t *testing.T) {
+	hub := NewHub()
+	r := httptest.NewRequest("GET", "/v1/connect", nil)
+	r.Header.Set("CF-Connecting-IP", "192.0.2.9")
+	r.RemoteAddr = "198.51.100.7:4000"
+	if ip := hub.clientIP(r); ip != "198.51.100.7" {
+		t.Fatal("trusted the header from a remote peer:", ip)
+	}
+	r.RemoteAddr = "127.0.0.1:4000"
+	if ip := hub.clientIP(r); ip != "192.0.2.9" {
+		t.Fatal("ignored the header from cloudflared:", ip)
+	}
+}
+
+func TestPolicyTooBig(t *testing.T) {
+	srv := setup(t)
+	mac, phone := dial(t, srv), dial(t, srv)
+	mac.writeJSON(map[string]any{"t": "policy", "allow": []string{phone.id}})
+	big := make([]string, maxAllow+1)
+	for i := range big {
+		big[i] = phone.id
+	}
+	mac.writeJSON(map[string]any{"t": "policy", "allow": big})
+	if r := mac.readJSON(); r["error"] != "too_big" {
+		t.Fatal(r)
+	}
+	// The previous policy stays.
+	phone.send(Header{To: mac.id, ID: "a", Last: true}, []byte("x"))
+	if h, _ := mac.recv(); h.From != phone.id {
+		t.Fatal(h)
+	}
+}
+
+func TestGoneKeepsNewest(t *testing.T) {
+	hub := NewHub()
+	at := time.Unix(0, 0)
+	hub.now = func() time.Time { return at }
+	for i := range maxGone + 1 {
+		at = at.Add(time.Second)
+		hub.remember(fmt.Sprint(i), policy{})
+	}
+	if _, ok := hub.gone["0"]; ok || len(hub.gone) != maxGone {
+		t.Fatalf("kept %d, oldest still there: %v", len(hub.gone), ok)
 	}
 }

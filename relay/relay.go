@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -28,9 +29,12 @@ const (
 	pingEvery    = 30 * time.Second // Cloudflare drops idle sockets after about 100 s
 	sendTimeout  = 10 * time.Second // how long a sender waits on a slow recipient
 	replyPassFor = 2 * time.Minute  // a device that sent a ticketed frame may be answered this long
-	queueFrames  = 256
-	queueLive    = 64  // live audio frames waiting; more are dropped, never queued behind
-	ratePerSec   = 400 // frames per second per connection, with the same burst
+	queueFrames  = 32               // about 8 MB at most per connection
+	queueLive    = 64               // live audio frames waiting; more are dropped, never queued behind
+	ratePerSec   = 400              // frames per second per connection, with the same burst
+	maxAllow     = 256              // keys in one policy
+	maxTickets   = 64               // tickets in one policy
+	maxGone      = 1024
 )
 
 var b64 = base64.RawURLEncoding
@@ -39,10 +43,20 @@ var b64 = base64.RawURLEncoding
 type Hub struct {
 	mu        sync.Mutex
 	conns     map[string]*conn
+	gone      map[string]goneEntry    // policies of devices that went offline, to answer their peers
 	replyPass map[[2]string]time.Time // {sender, recipient} → until
+	perIP     map[string]int
+	total     int
 	now       func() time.Time
 	logf      func(string, ...any)
 	ice       []ICEServer
+
+	// MaxConns and MaxConnsPerIP cap open connections, counted from before login; 0 means no cap.
+	MaxConns, MaxConnsPerIP int
+
+	// IPHeader names the header that carries the client's address when a proxy on this machine
+	// (cloudflared) forwards the connection. It is trusted only from a loopback peer.
+	IPHeader string
 
 	// Host, when set, is the only host name a login may be signed for. Without it the request's
 	// Host header is used, which is fine behind a proxy that routes by host name (Cloudflare
@@ -57,17 +71,29 @@ type ICEServer struct {
 
 // NewHub makes a hub that tells clients about these ICE servers when they log in.
 func NewHub(ice ...ICEServer) *Hub {
-	return &Hub{conns: map[string]*conn{}, replyPass: map[[2]string]time.Time{}, now: time.Now, logf: log.Printf, ice: ice}
+	return &Hub{conns: map[string]*conn{}, gone: map[string]goneEntry{}, replyPass: map[[2]string]time.Time{},
+		perIP: map[string]int{}, now: time.Now, logf: log.Printf, ice: ice,
+		MaxConns: 256, MaxConnsPerIP: 16, IPHeader: "CF-Connecting-IP"}
+}
+
+// policy is who may reach a device: its paired keys, and tickets for pairing codes on screen.
+type policy struct {
+	allow   map[string]bool
+	tickets map[string]time.Time // sha256(code) hex → expiry
+}
+
+type goneEntry struct {
+	pol policy
+	at  time.Time
 }
 
 type conn struct {
-	id      string
-	ws      *websocket.Conn
-	out     chan outFrame
-	live    chan outFrame // lossy frames: sent before out, dropped when full
-	done    chan struct{}
-	allow   map[string]bool
-	tickets map[string]time.Time // sha256(code) hex → expiry
+	id   string
+	ws   *websocket.Conn
+	out  chan outFrame
+	live chan outFrame // lossy frames: sent before out, dropped when full
+	done chan struct{}
+	pol  policy
 }
 
 type outFrame struct {
@@ -105,6 +131,12 @@ func LoginMessage(host string, nonce []byte) []byte {
 
 // ServeHTTP handles /v1/connect.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ip := h.clientIP(r)
+	if status := h.admit(ip); status != 0 {
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	defer h.release(ip)
 	ws, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -123,11 +155,12 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := &conn{id: id, ws: ws, out: make(chan outFrame, queueFrames), live: make(chan outFrame, queueLive), done: make(chan struct{}),
-		allow: map[string]bool{}, tickets: map[string]time.Time{}}
+		pol: policy{allow: map[string]bool{}, tickets: map[string]time.Time{}}}
 
 	h.mu.Lock()
 	old := h.conns[id]
 	h.conns[id] = c
+	delete(h.gone, id)
 	online := len(h.conns)
 	h.mu.Unlock()
 	if old != nil {
@@ -144,11 +177,67 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	if h.conns[id] == c {
 		delete(h.conns, id)
+		h.remember(id, c.pol)
 	}
 	online = len(h.conns)
 	h.mu.Unlock()
 	h.logf("disconnect %s (%d online): %v", short(id), online, websocket.CloseStatus(err))
 	ws.CloseNow()
+}
+
+// clientIP is the address connection limits count against.
+func (h *Hub) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); h.IPHeader != "" && ip != nil && ip.IsLoopback() {
+		if v := r.Header.Get(h.IPHeader); v != "" {
+			return v
+		}
+	}
+	return host
+}
+
+// admit takes a connection slot for ip, or says which status to refuse with.
+func (h *Hub) admit(ip string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.MaxConns > 0 && h.total >= h.MaxConns {
+		h.logf("refused: full (%d connections)", h.total)
+		return http.StatusServiceUnavailable
+	}
+	if h.MaxConnsPerIP > 0 && h.perIP[ip] >= h.MaxConnsPerIP {
+		h.logf("refused: too many connections from one address")
+		return http.StatusTooManyRequests
+	}
+	h.total++
+	h.perIP[ip]++
+	return 0
+}
+
+func (h *Hub) release(ip string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.total--
+	if h.perIP[ip]--; h.perIP[ip] <= 0 {
+		delete(h.perIP, ip)
+	}
+}
+
+// remember keeps a disconnected device's policy, so its paired peers hear "offline" and everyone
+// else "not_allowed". Memory only, oldest dropped first. Call with h.mu held.
+func (h *Hub) remember(id string, p policy) {
+	if len(h.gone) >= maxGone {
+		oldest, at := "", h.now()
+		for k, g := range h.gone {
+			if !g.at.After(at) {
+				oldest, at = k, g.at
+			}
+		}
+		delete(h.gone, oldest)
+	}
+	h.gone[id] = goneEntry{p, h.now()}
 }
 
 func (h *Hub) login(ctx context.Context, ws *websocket.Conn, host string) (string, error) {
@@ -205,6 +294,10 @@ func (h *Hub) control(c *conn, data []byte) {
 		c.sendJSON(map[string]any{"t": "error", "error": "bad_control"})
 		return
 	}
+	if len(m.Allow) > maxAllow || len(m.Tickets) > maxTickets {
+		c.sendJSON(map[string]any{"t": "error", "error": "too_big"}) // the previous policy stays
+		return
+	}
 	allow := map[string]bool{}
 	for _, k := range m.Allow {
 		if _, ok := decodeKey(k); ok {
@@ -218,7 +311,7 @@ func (h *Hub) control(c *conn, data []byte) {
 		}
 	}
 	h.mu.Lock()
-	c.allow, c.tickets = allow, tickets
+	c.pol = policy{allow, tickets}
 	h.mu.Unlock()
 }
 
@@ -242,10 +335,16 @@ func (h *Hub) forward(ctx context.Context, c *conn, data []byte) {
 		return
 	}
 
+	// Whether the recipient is online is told only to senders it allows, online or not.
 	h.mu.Lock()
 	to := h.conns[hd.To]
-	ok := to != nil && h.allowed(c.id, to, hd.Ticket)
-	if ok && hd.Ticket != "" {
+	var ok bool
+	if to != nil {
+		ok = h.allowed(c.id, to.id, to.pol, hd.Ticket)
+	} else if g, found := h.gone[hd.To]; found {
+		ok = h.allowed(c.id, hd.To, g.pol, hd.Ticket)
+	}
+	if ok && to != nil && hd.Ticket != "" {
 		now := h.now()
 		for k, until := range h.replyPass { // ticketed frames are rare (pairing), so a sweep is cheap
 			if !now.Before(until) {
@@ -255,12 +354,12 @@ func (h *Hub) forward(ctx context.Context, c *conn, data []byte) {
 		h.replyPass[[2]string{to.id, c.id}] = now.Add(replyPassFor)
 	}
 	h.mu.Unlock()
-	if to == nil {
-		fail("offline")
-		return
-	}
 	if !ok {
 		fail("not_allowed")
+		return
+	}
+	if to == nil {
+		fail("offline")
 		return
 	}
 
@@ -289,20 +388,20 @@ func (h *Hub) forward(ctx context.Context, c *conn, data []byte) {
 	}
 }
 
-// allowed says whether sender may reach to. Call with h.mu held.
-func (h *Hub) allowed(sender string, to *conn, ticket string) bool {
+// allowed says whether sender may reach the device to, whose policy is p. Call with h.mu held.
+func (h *Hub) allowed(sender, to string, p policy, ticket string) bool {
 	now := h.now()
-	if to.allow[sender] {
+	if p.allow[sender] {
 		return true
 	}
-	if exp, ok := to.tickets[ticket]; ticket != "" && ok && now.Before(exp) {
+	if exp, ok := p.tickets[ticket]; ticket != "" && ok && now.Before(exp) {
 		return true
 	}
-	if until, ok := h.replyPass[[2]string{sender, to.id}]; ok {
+	if until, ok := h.replyPass[[2]string{sender, to}]; ok {
 		if now.Before(until) {
 			return true
 		}
-		delete(h.replyPass, [2]string{sender, to.id})
+		delete(h.replyPass, [2]string{sender, to})
 	}
 	return false
 }

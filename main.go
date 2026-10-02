@@ -18,6 +18,9 @@ var version = "dev"
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8790", "listen address (cloudflared points here)")
 	host := flag.String("host", "", "public host name clients sign their login for (e.g. switchboard.example); default: the request's Host header")
+	maxConns := flag.Int("max-conns", 256, "open connections at most, 0 for no cap")
+	maxPerIP := flag.Int("max-conns-per-ip", 16, "open connections per client address at most, 0 for no cap")
+	ipHeader := flag.String("ip-header", "CF-Connecting-IP", "header with the client address, trusted only from a proxy on this machine; empty to ignore")
 	stun := flag.String("stun", "", "STUN servers for direct calls, comma separated (e.g. stun:stun.cloudflare.com:3478)")
 	flag.Parse()
 
@@ -28,6 +31,7 @@ func main() {
 
 	hub := relay.NewHub(ice...)
 	hub.Host = *host
+	hub.MaxConns, hub.MaxConnsPerIP, hub.IPHeader = *maxConns, *maxPerIP, *ipHeader
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/connect", hub)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

@@ -25,7 +25,9 @@ testkit/.venv/bin/python testkit/echo_peer.py --switchboard http://127.0.0.1:879
 
 Flags: `-addr` (listen address), `-stun` (STUN servers handed to clients, comma separated), `-host`
 (the public host name logins must be signed for; set it whenever the relay is reachable other than
-through a proxy that routes by host name).
+through a proxy that routes by host name), `-max-conns` (256) and `-max-conns-per-ip` (16)
+(connection caps, 0 for none), `-ip-header` (`CF-Connecting-IP`: where a proxy on the same machine
+puts the client's address; trusted only from a loopback peer).
 
 ## Repo map
 
@@ -80,6 +82,8 @@ Full detail: [docs/protocol.md](docs/protocol.md). All keys and ids are base64ur
    - `offline`: the Mac isn't connected. Try the next route if the app has one.
    - `not_allowed`: this Switchboard won't carry you to that Mac right now. Try the next route and
      **keep the pairing**. Only the Mac itself, inside a sealed answer, can say you are unpaired.
+     Strangers get this instead of `offline`, and so may you right after Switchboard restarts.
+   - HTTP `429` or `503` on connect: too many connections. Retry with backoff.
    - `slow`, `rate_limited`: treat as no answer. `too_big`, `bad_frame`: a bug on your side.
 8. **Stay up.** Switchboard pings every 30 s. On a drop: reconnect, log in, re-send the policy. A
    newer login with the same key replaces the older connection.
@@ -153,6 +157,7 @@ expected.
 - **The relay sets `from`** and strips `ticket`. A client can never choose who a frame claims to be from.
 - **Not an open relay.** A frame reaches a device only if that device allowed the sender, or the
   frame carries a live ticket it registered, or it recently sent the sender a ticketed frame.
+- **No presence for strangers.** Whether a device is online is told only to senders it allows.
 - Dependencies stay permissive (MIT, BSD, ISC, Apache-2.0). No GPL, AGPL or LGPL.
 - `docs/protocol.md` is the contract. Change it first, then the code, then `docs/test-vectors.json`.
 

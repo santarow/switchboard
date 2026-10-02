@@ -20,8 +20,9 @@ taking the relay down with little effort from one connection.
 
 ## Out of scope
 
-- Denial of service that needs many connections or a lot of bandwidth. The relay has per-connection
-  limits only; see [docs/security-review.md](docs/security-review.md) for known limits.
+- Denial of service that needs many addresses or a lot of bandwidth. The relay caps connections
+  in total and per address, and queues per connection; see
+  [docs/security-review.md](docs/security-review.md) for known limits.
 - Traffic analysis: who talks to whom, when, and how much. The relay sees routing headers by design.
 - No forward secrecy: the box keys are long-lived (protocol.md section 9). Known and documented.
 - Bugs in client apps built on the protocol, unless the protocol itself causes them.
