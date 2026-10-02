@@ -42,6 +42,7 @@ no UDP itself. `-host` pins the host name logins are signed for; set it in produ
 TLS (for example a Cloudflare Tunnel pointed at the address above).
 
 Linux: `GOOS=linux GOARCH=amd64 go build -o switchboard-linux .`
+Or install it: `go install github.com/santarow/switchboard@latest`.
 
 ## Test
 

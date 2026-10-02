@@ -1,4 +1,4 @@
-module github.com/jasonjias/switchboard
+module github.com/santarow/switchboard
 
 go 1.27.1
 

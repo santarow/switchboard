@@ -11,6 +11,7 @@ computer allows. Everything is sealed end to end in the apps, so Switchboard can
 ## Commands
 
 ```bash
+go install github.com/santarow/switchboard@latest   # or, from a clone:
 go build -o switchboard .                       # one static binary
 ./switchboard -addr 127.0.0.1:8790 -stun stun:stun.cloudflare.com:3478
 curl -s 127.0.0.1:8790/healthz                  # {"ok":true,"version":"dev"}

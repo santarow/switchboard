@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonjias/switchboard/relay"
+	"github.com/santarow/switchboard/relay"
 )
 
 var version = "dev"
