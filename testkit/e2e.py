@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""End to end on localhost: Switchboard + buddy's mock_workshop.py + the Mac bridge + a phone.
+"""End to end on localhost: Switchboard + the SantaRow apps' mock server (mock_workshop.py, from the
+Buddy repo, not included here) + the Mac bridge + a phone. To test your own client, use echo_peer.py.
 
-    testkit/.venv/bin/python testkit/e2e.py [--mock ~/repos/santarow/buddy/scripts/mock_workshop.py]
+    testkit/.venv/bin/python testkit/e2e.py [--mock path/to/mock_workshop.py]
 
 The phone pairs through Switchboard, then runs the calls in buddy/docs/pairing.md (hello, holly,
 call start, a turn with a 3 MB WAV, poll, audio, stop, end), then the failures: a second scan of the
@@ -153,7 +154,7 @@ async def phone_steps(link):
 
 
 async def call_steps(phone):
-    """#140: signaling as sealed messages, then the fallback: live audio over the socket."""
+    """Calls: signaling as sealed messages, then the fallback: live audio over the socket."""
     check(phone.conn.ice == [{"urls": ["stun:stun.example:3478"]}], "login lists the STUN server")
 
     async def next_event(kind=None, secs=5):

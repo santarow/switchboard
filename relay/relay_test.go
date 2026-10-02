@@ -272,3 +272,90 @@ func TestLiveGoesFirst(t *testing.T) {
 	}
 	t.Fatal("audio never arrived")
 }
+
+// With Host pinned, a login signed for the host name the client happened to use is refused.
+func TestPinnedHost(t *testing.T) {
+	hub := NewHub()
+	hub.logf = func(string, ...any) {}
+	hub.Host = "switchboard.example"
+	srv := httptest.NewServer(hub)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	login := func(host string) error {
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ws.CloseNow()
+		pub, priv, _ := ed25519.GenerateKey(nil)
+		_, data, _ := ws.Read(ctx)
+		var ch map[string]string
+		json.Unmarshal(data, &ch)
+		nonce, _ := b64.DecodeString(ch["nonce"])
+		msg, _ := json.Marshal(map[string]string{"t": "login", "id": b64.EncodeToString(pub),
+			"sig": b64.EncodeToString(ed25519.Sign(priv, LoginMessage(host, nonce)))})
+		ws.Write(ctx, websocket.MessageText, msg)
+		_, _, err = ws.Read(ctx)
+		return err
+	}
+	if err := login(strings.TrimPrefix(srv.URL, "http://")); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("login for the dialed host should fail when Host is pinned: %v", err)
+	}
+	if err := login("switchboard.example"); err != nil {
+		t.Fatalf("login for the pinned host: %v", err)
+	}
+}
+
+// A live audio frame must be small; a big one is refused rather than queued ahead of everything.
+func TestLossyTooBig(t *testing.T) {
+	srv := setup(t)
+	mac, phone := dial(t, srv), dial(t, srv)
+	mac.writeJSON(map[string]any{"t": "policy", "allow": []string{phone.id}})
+	settle()
+	phone.send(Header{To: mac.id, ID: "a", Last: true, Lossy: true}, make([]byte, maxLossy+1))
+	if r := phone.readJSON(); r["error"] != "too_big" || r["re"] != "a" {
+		t.Fatal(r)
+	}
+}
+
+// A second login with the same key replaces the first, and the hub keeps relaying meanwhile.
+func TestReplaceDoesNotBlock(t *testing.T) {
+	hub := NewHub()
+	hub.logf = func(string, ...any) {}
+	srv := httptest.NewServer(hub)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	connect := func() *websocket.Conn {
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, data, _ := ws.Read(ctx)
+		var ch map[string]string
+		json.Unmarshal(data, &ch)
+		nonce, _ := b64.DecodeString(ch["nonce"])
+		msg, _ := json.Marshal(map[string]string{"t": "login", "id": b64.EncodeToString(pub),
+			"sig": b64.EncodeToString(ed25519.Sign(priv, LoginMessage(strings.TrimPrefix(srv.URL, "http://"), nonce)))})
+		ws.Write(ctx, websocket.MessageText, msg)
+		if _, data, err := ws.Read(ctx); err != nil || !strings.Contains(string(data), `"ready"`) {
+			t.Fatalf("login: %s %v", data, err)
+		}
+		return ws
+	}
+	first := connect() // never reads again, so it won't answer the close handshake
+	defer first.CloseNow()
+	start := time.Now()
+	second := connect()
+	defer second.CloseNow()
+	other := dial(t, srv)
+	other.send(Header{To: strings.Repeat("A", 43), ID: "x"}, nil)
+	if r := other.readJSON(); r["error"] != "offline" {
+		t.Fatal(r)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("the hub stalled while closing the replaced connection")
+	}
+}

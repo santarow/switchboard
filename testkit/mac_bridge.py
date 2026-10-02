@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plays Workshop's broker side: keeps a Switchboard connection open, opens each sealed request,
 replays it as plain HTTP against a local Workshop (or buddy/scripts/mock_workshop.py), and seals the
-answer back. Workshop's own Swift code does the same job in-process (#141).
+answer back. The Workshop app does the same job in-process.
 
     testkit/.venv/bin/python testkit/mac_bridge.py --switchboard http://127.0.0.1:8790 \
         --workshop http://127.0.0.1:8788 --link <mock's link.txt> --state testkit/.state

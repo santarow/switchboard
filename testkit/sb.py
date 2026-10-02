@@ -1,6 +1,6 @@
 """Switchboard client side, for tests: keys, sealed envelopes, frames, and an asyncio connection.
 
-This is the reference for what Buddy and Workshop implement in CryptoKit (docs/protocol.md).
+This is the reference client for docs/protocol.md; native apps do the same in CryptoKit.
 Test-only: needs `cryptography` (Apache-2.0 OR BSD-3-Clause) and `websockets` (BSD-3-Clause).
 """
 import asyncio, base64, json, os, struct
@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 CHUNK = 256 * 1024
+LOGIN_PREFIX = b"switchboard-v1 login\n"
 RAW = dict(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
 RAW_PRIV = dict(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw,
                 encryption_algorithm=serialization.NoEncryption())
@@ -81,7 +82,7 @@ class Conn:
         ws_url = ("wss" if u.scheme == "https" else "ws") + "://" + u.netloc + u.path.rstrip("/") + "/v1/connect"
         self.ws = await websockets.connect(ws_url, max_size=2 * CHUNK)
         ch = json.loads(await self.ws.recv())
-        msg = b"switchboard-v1 login\n" + u.netloc.encode() + b"\n" + b64d(ch["nonce"])
+        msg = LOGIN_PREFIX + u.netloc.encode() + b"\n" + b64d(ch["nonce"])
         await self.ws.send(json.dumps({"t": "login", "id": self.keys.id, "sig": b64e(self.keys.sign.sign(msg))}))
         ready = json.loads(await self.ws.recv())
         assert ready.get("t") == "ready", ready

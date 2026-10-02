@@ -3,8 +3,31 @@
 Connects a phone to a computer that has no public address. Both connect out to Switchboard; it
 relays sealed messages between paired keys and never holds a key that can open them.
 
+```
+  phone                       Switchboard                       Mac
+ ┌───────┐  sealed box  ┌─────────────────────┐  sealed box  ┌───────┐
+ │ keys  │ ───────────▶ │ reads only "to/from"│ ───────────▶ │ keys  │
+ │       │ ◀─────────── │ can't open the box  │ ◀─────────── │       │
+ └───────┘   outbound   └─────────────────────┘   outbound   └───────┘
+             WebSocket     no disk, no keys       WebSocket
+```
+
+## Why Switchboard
+
+- **No VPN, no open ports.** The computer stays behind its router; both ends dial out over HTTPS.
+  Works behind a Cloudflare Tunnel, on a small VPS, or anywhere that runs one binary.
+- **The relay can't read your messages.** Every message is sealed in the apps with X25519 +
+  ChaCha20-Poly1305 (Apple CryptoKit has all of it). Switchboard only routes by public key.
+- **Not an open relay.** The computer tells Switchboard which phones may reach it; pairing uses a
+  one-time code from a QR.
+- **Nothing to run beside it.** One Go binary, one dependency, no database, nothing on disk.
+
+## Docs
+
+- Writing a client or working on the code: [AGENTS.md](AGENTS.md)
+- Wire protocol: [docs/protocol.md](docs/protocol.md), with [test vectors](docs/test-vectors.json)
 - Design and choices: [docs/design.md](docs/design.md)
-- Wire protocol (what clients implement): [docs/protocol.md](docs/protocol.md)
+- Security: [SECURITY.md](SECURITY.md) and [docs/security-review.md](docs/security-review.md)
 
 ## Run
 
@@ -13,7 +36,7 @@ go build -o switchboard . && ./switchboard -addr 127.0.0.1:8790 -stun stun:stun.
 ```
 
 `-stun` is the STUN server clients use to try a direct call first; Switchboard passes it on and needs
-no UDP itself.
+no UDP itself. `-host` pins the host name logins are signed for; set it in production.
 
 `GET /healthz` answers `{"ok":true}`. Clients connect to `GET /v1/connect` (WebSocket). Put it behind
 TLS (for example a Cloudflare Tunnel pointed at the address above).
@@ -26,12 +49,15 @@ Linux: `GOOS=linux GOARCH=amd64 go build -o switchboard-linux .`
 go test -race ./...
 ```
 
-End to end on localhost, with Buddy's `scripts/mock_workshop.py` as the computer:
+Client side, with Python's `cryptography` and `websockets`:
 
 ```bash
 python3 -m venv testkit/.venv && testkit/.venv/bin/pip install cryptography websockets
-testkit/.venv/bin/python testkit/e2e.py
+testkit/.venv/bin/python testkit/vectors.py      # test vectors still match the reference client
+testkit/.venv/bin/python testkit/echo_peer.py    # a stand-in computer to test your client against
 ```
+
+See [AGENTS.md](AGENTS.md#check-your-client).
 
 ## Third-party
 

@@ -23,6 +23,7 @@ const (
 	maxHeader    = 2 << 10   // routing header of a binary frame
 	maxPayload   = 256 << 10 // sealed bytes per frame; bigger messages go in several frames
 	maxFrame     = 2 + maxHeader + maxPayload
+	maxLossy     = 16 << 10 // one sealed 20 ms audio frame is well under 2 KB
 	loginTimeout = 10 * time.Second
 	pingEvery    = 30 * time.Second // Cloudflare drops idle sockets after about 100 s
 	sendTimeout  = 10 * time.Second // how long a sender waits on a slow recipient
@@ -42,6 +43,11 @@ type Hub struct {
 	now       func() time.Time
 	logf      func(string, ...any)
 	ice       []ICEServer
+
+	// Host, when set, is the only host name a login may be signed for. Without it the request's
+	// Host header is used, which is fine behind a proxy that routes by host name (Cloudflare
+	// Tunnel) but lets a client name any host when the relay is reachable directly.
+	Host string
 }
 
 // ICEServer is a STUN or TURN server the clients may use for direct calls, in WebRTC's shape.
@@ -107,7 +113,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	id, err := h.login(ctx, ws, r.Host)
+	host := r.Host
+	if h.Host != "" {
+		host = h.Host
+	}
+	id, err := h.login(ctx, ws, host)
 	if err != nil {
 		ws.Close(websocket.StatusPolicyViolation, "login failed")
 		return
@@ -116,12 +126,14 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		allow: map[string]bool{}, tickets: map[string]time.Time{}}
 
 	h.mu.Lock()
-	if old := h.conns[id]; old != nil {
-		old.ws.Close(websocket.StatusGoingAway, "replaced by a newer connection")
-	}
+	old := h.conns[id]
 	h.conns[id] = c
 	online := len(h.conns)
 	h.mu.Unlock()
+	if old != nil {
+		// Close waits for the old peer's answer, so never under the hub lock.
+		go old.ws.Close(websocket.StatusGoingAway, "replaced by a newer connection")
+	}
 	h.logf("connect %s (%d online)", short(id), online)
 
 	go c.writer(ctx, cancel)
@@ -225,12 +237,22 @@ func (h *Hub) forward(ctx context.Context, c *conn, data []byte) {
 		return
 	}
 	fail := func(e string) { c.sendJSON(map[string]any{"t": "error", "re": hd.ID, "error": e}) }
+	if hd.Lossy && len(data)-2-n > maxLossy {
+		fail("too_big")
+		return
+	}
 
 	h.mu.Lock()
 	to := h.conns[hd.To]
 	ok := to != nil && h.allowed(c.id, to, hd.Ticket)
 	if ok && hd.Ticket != "" {
-		h.replyPass[[2]string{to.id, c.id}] = h.now().Add(replyPassFor)
+		now := h.now()
+		for k, until := range h.replyPass { // ticketed frames are rare (pairing), so a sweep is cheap
+			if !now.Before(until) {
+				delete(h.replyPass, k)
+			}
+		}
+		h.replyPass[[2]string{to.id, c.id}] = now.Add(replyPassFor)
 	}
 	h.mu.Unlock()
 	if to == nil {
