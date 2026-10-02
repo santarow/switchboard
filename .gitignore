@@ -3,3 +3,4 @@ testkit/.venv/
 testkit/.state/
 __pycache__/
 .DS_Store
+/dist/
